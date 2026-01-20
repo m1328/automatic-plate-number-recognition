@@ -2,128 +2,228 @@ import re
 import cv2
 import numpy as np
 import pytesseract
+from typing import List, Tuple
 
 
 def normalize_plate_text(s: str) -> str:
+    """Normalizuje tekst tablicy do wielkich liter i cyfr."""
     s = s.upper()
     s = re.sub(r"[^A-Z0-9]", "", s)
     return s
 
 
-def preprocess_for_ocr(plate_bgr: np.ndarray, variant: str = "main") -> np.ndarray:
-    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+def is_valid_polish_plate(text: str) -> bool:
+    """
+    Sprawdza czy tekst przypomina polską tablicę.
+    Formaty: ABC1234, AB12345, ABC123D itp.
+    """
+    if not text or len(text) < 5 or len(text) > 8:
+        return False
 
-    th = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 7
-    )
+    # Powinny być litery i cyfry
+    has_letter = any(c.isalpha() for c in text)
+    has_digit = any(c.isdigit() for c in text)
 
-    # warianty pomagają przy różnych warunkach
-    if variant == "invert":
-        th = cv2.bitwise_not(th)
-
-    # auto-invert jeśli "za biało"
-    white_ratio = (th > 0).mean()
-    if white_ratio > 0.88:
-        th = cv2.bitwise_not(th)
-
-    # delikatne czyszczenie tylko w głównym wariancie
-    if variant == "main":
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    return th
+    return has_letter and has_digit
 
 
-def read_plate_by_chars(plate_bgr: np.ndarray, whitelist: str) -> str:
-    img = preprocess_for_ocr(plate_bgr)  # binarka 0/255
+def fix_common_ocr_errors(text: str) -> str:
+    """Poprawia typowe błędy OCR dla polskich tablic."""
+    # Mapowanie częstych pomyłek
+    corrections = {
+        'O': '0',  # litera O -> cyfra 0 w kontekście cyfr
+        'I': '1',  # litera I -> cyfra 1
+        'l': '1',  # mała litera l -> cyfra 1
+        'Z': '2',  # czasem Z -> 2
+        'S': '5',  # czasem S -> 5
+        'B': '8',  # czasem B -> 8
+    }
 
-    # upewnij się, że znaki są czarne na białym tle
-    if (img > 0).mean() > 0.85:
-        img = cv2.bitwise_not(img)
+    # Stosuj korekty inteligentnie - tylko w kontekście cyfr
+    result = []
+    for i, char in enumerate(text):
+        # Jeśli znak jest otoczony cyframi, prawdopodobnie też powinien być cyfrą
+        neighbors_are_digits = False
+        if i > 0 and text[i - 1].isdigit():
+            neighbors_are_digits = True
+        if i < len(text) - 1 and text[i + 1].isdigit():
+            neighbors_are_digits = True
 
-    h, w = img.shape[:2]
+        if neighbors_are_digits and char in corrections:
+            result.append(corrections[char])
+        else:
+            result.append(char)
 
-    # znajdź kontury potencjalnych znaków
-    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return ''.join(result)
 
-    boxes = []
-    for c in contours:
-        x, y, ww, hh = cv2.boundingRect(c)
-        area = ww * hh
 
-        # filtry szumu (można później dopasować)
-        if area < 120:
+def preprocess_plate_v2(plate_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    Zwraca wiele wariantów preprocessingu - zwiększa szansę na sukces.
+    """
+    results = []
+
+    # Powiększ obraz (ważne dla OCR)
+    scale = 3.0
+    h, w = plate_bgr.shape[:2]
+    plate_large = cv2.resize(plate_bgr, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(plate_large, cv2.COLOR_BGR2GRAY)
+
+    # Wariant 1: Bilateral filter + adaptive threshold
+    blurred = cv2.bilateralFilter(gray, 11, 17, 17)
+    thresh1 = cv2.adaptiveThreshold(blurred, 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+    results.append(thresh1)
+
+    # Wariant 2: Otsu thresholding
+    blurred2 = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh2 = cv2.threshold(blurred2, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    results.append(thresh2)
+
+    # Wariant 3: Inverted Otsu
+    results.append(cv2.bitwise_not(thresh2))
+
+    # Wariant 4: Morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    morph = cv2.morphologyEx(thresh1, cv2.MORPH_CLOSE, kernel)
+    results.append(morph)
+
+    # Wariant 5: CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    _, thresh5 = cv2.threshold(enhanced, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    results.append(thresh5)
+
+    return results
+
+
+def run_tesseract_configs(img: np.ndarray, whitelist: str) -> List[str]:
+    """
+    Próbuje różnych konfiguracji Tesseract.
+    """
+    results = []
+
+    # Różne Page Segmentation Modes
+    psm_modes = [7, 8, 6, 13]  # 7=single line, 8=single word, 6=block, 13=raw line
+
+    for psm in psm_modes:
+        config = f'--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}'
+        try:
+            text = pytesseract.image_to_string(img, config=config)
+            text = normalize_plate_text(text)
+            if text:
+                results.append(text)
+        except:
             continue
-        if hh < 0.35 * h:
-            continue
-        if ww < 0.02 * w:
-            continue
-        if ww > 0.35 * w:
-            continue
 
-        boxes.append((x, y, ww, hh))
+    return results
 
-    if not boxes:
+
+def score_plate_candidate(text: str, expected_length: int = 7) -> float:
+    """
+    Ocenia jakość kandydata na tablicę (0.0 - 1.0).
+    """
+    if not text:
+        return 0.0
+
+    score = 0.0
+
+    # Długość bliska oczekiwanej
+    length_diff = abs(len(text) - expected_length)
+    if length_diff == 0:
+        score += 0.5
+    elif length_diff == 1:
+        score += 0.3
+    elif length_diff == 2:
+        score += 0.1
+
+    # Ma litery i cyfry
+    if is_valid_polish_plate(text):
+        score += 0.3
+
+    # Format polski: litery na początku, cyfry dalej
+    if len(text) >= 5:
+        first_part = text[:3]
+        last_part = text[3:]
+
+        if first_part.isalpha() and any(c.isdigit() for c in last_part):
+            score += 0.2
+
+    return min(score, 1.0)
+
+
+def read_plate_text_improved(plate_bgr: np.ndarray, whitelist: str) -> str:
+    """
+    Główna funkcja OCR - próbuje wielu wariantów i wybiera najlepszy.
+    """
+    if plate_bgr is None or plate_bgr.size == 0:
         return ""
 
-    # sortuj od lewej do prawej
-    boxes.sort(key=lambda b: b[0])
+    # Generuj różne preprocessingi
+    preprocessed_images = preprocess_plate_v2(plate_bgr)
 
-    chars = []
-    for (x, y, ww, hh) in boxes:
-        ch_img = img[y:y + hh, x:x + ww]
+    candidates = []
 
-        # powiększ znak
-        ch_img = cv2.resize(ch_img, (45, 70), interpolation=cv2.INTER_CUBIC)
+    # Dla każdego preprocessingu próbuj różnych konfiguracji Tesseract
+    for img in preprocessed_images:
+        texts = run_tesseract_configs(img, whitelist)
+        candidates.extend(texts)
 
-        cfg = f"--oem 3 --psm 10 -c tessedit_char_whitelist={whitelist}"
-        raw = pytesseract.image_to_string(ch_img, config=cfg)
-        ch = normalize_plate_text(raw)
+    if not candidates:
+        return ""
 
-        if ch:
-            chars.append(ch[0])
+    # Usuń duplikaty
+    candidates = list(set(candidates))
 
-    text = "".join(chars)
-    return text
+    # Popraw błędy OCR
+    candidates = [fix_common_ocr_errors(c) for c in candidates]
 
-def fix_common_ocr_confusions(s: str) -> str:
-    # typowe pomyłki dla tablic
-    repl = str.maketrans({
-        "I": "1",
-        "L": "1",
-    })
-    return s.translate(repl)
+    # Oceń każdego kandydata
+    scored = [(c, score_plate_candidate(c)) for c in candidates]
+    scored.sort(key=lambda x: x[1], reverse=True)
 
-def ocr_on_image(img: np.ndarray, whitelist: str, psm: int) -> str:
-    cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}"
-    raw = pytesseract.image_to_string(img, config=cfg)
-    return fix_common_ocr_confusions(normalize_plate_text(raw))
+    # Zwróć najlepszego
+    return scored[0][0] if scored else ""
 
 
-def read_plate_text_candidates(plate_bgr: np.ndarray, whitelist: str) -> tuple[str, str]:
-    img_main = preprocess_for_ocr(plate_bgr, variant="main")
-    img_inv = preprocess_for_ocr(plate_bgr, variant="invert")
+def read_plate_text_candidates(plate_bgr: np.ndarray, whitelist: str) -> Tuple[str, str]:
+    """
+    Zwraca dwa najlepsze kandydaty (dla kompatybilności z evaluate.py).
+    """
+    if plate_bgr is None or plate_bgr.size == 0:
+        return "", ""
 
-    line_main = ocr_on_image(img_main, whitelist, psm=7)
-    line_inv  = ocr_on_image(img_inv,  whitelist, psm=8)
+    preprocessed_images = preprocess_plate_v2(plate_bgr)
 
-    # fallback jeśli któryś pusty
-    if not line_inv:
-        line_inv = line_main
-    if not line_main:
-        line_main = line_inv
+    all_candidates = []
 
-    return line_main, line_inv
+    for img in preprocessed_images[:3]:  # Pierwsze 3 warianty dla szybkości
+        texts = run_tesseract_configs(img, whitelist)
+        all_candidates.extend(texts)
+
+    if not all_candidates:
+        return "", ""
+
+    # Usuń duplikaty i popraw błędy
+    candidates = list(set(all_candidates))
+    candidates = [fix_common_ocr_errors(c) for c in candidates]
+
+    # Oceń
+    scored = [(c, score_plate_candidate(c)) for c in candidates]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Zwróć top 2
+    best = scored[0][0] if len(scored) > 0 else ""
+    second = scored[1][0] if len(scored) > 1 else best
+
+    return best, second
 
 
-
+# Zachowaj starą funkcję dla kompatybilności
 def read_plate_text(plate_bgr: np.ndarray, whitelist: str) -> str:
-    best_line, by_chars = read_plate_text_candidates(plate_bgr, whitelist)
-    # nadal zwracaj “najbardziej sensowne” do similarity
-    candidates = [best_line, by_chars]
-    candidates.sort(key=lambda s: (abs(len(s) - 7), -len(s)))
-    return candidates[0]
-
+    return read_plate_text_improved(plate_bgr, whitelist)

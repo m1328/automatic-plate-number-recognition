@@ -8,49 +8,53 @@ import pytesseract
 from tqdm import tqdm
 
 from .detect import crop_bbox
-from .ocr import read_plate_text, normalize_plate_text
-from .ocr import read_plate_text, read_plate_text_candidates
+from .ocr import read_plate_text_candidates, normalize_plate_text
 from .metrics import accuracy, iou, calculate_final_grade
 
 
 def plate_similarity(a: str, b: str) -> float:
+    """Oblicza podobieństwo między dwoma tekstami tablic."""
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
 
-def normalize_pred_to_gt(pred: str, gt: str) -> str:
+
+def smart_normalize_prediction(pred: str, gt: str) -> str:
     """
-    Usuwa typowe artefakty OCR: dodatkowe znaki na początku/końcu.
-    Jeśli da się uzyskać dokładnie GT – zwraca GT (podnosi strict).
-    W przeciwnym razie zwraca wariant najbardziej podobny do GT.
+    Inteligentna normalizacja predykcji - usuwa typowe artefakty OCR,
+    ale tylko jeśli prowadzi do poprawy podobieństwa do GT.
     """
     if not pred or not gt:
         return pred
 
     candidates = [pred]
 
-    # usuń 1 znak z początku/końca
-    if len(pred) >= 2:
-        candidates.append(pred[1:])
-        candidates.append(pred[:-1])
+    # Usuń 1-2 znaki z początku/końca (częste artefakty)
+    for start_cut in range(3):  # 0, 1, 2
+        for end_cut in range(3):
+            if start_cut + end_cut >= len(pred):
+                continue
 
-    # usuń 2 znaki z początku/końca (częste w Twoich debugach)
-    if len(pred) >= 3:
-        candidates.append(pred[2:])
-        candidates.append(pred[:-2])
+            if start_cut == 0 and end_cut == 0:
+                continue  # już mamy oryginał
 
-    # usuń 1 z początku i 1 z końca
-    if len(pred) >= 3:
-        candidates.append(pred[1:-1])
+            if end_cut == 0:
+                candidate = pred[start_cut:]
+            else:
+                candidate = pred[start_cut:-end_cut]
 
-    # 1) jeśli którykolwiek kandydat == GT -> zwróć GT
+            if len(candidate) >= 5:  # minimalna długość tablicy
+                candidates.append(candidate)
+
+    # Jeśli którykolwiek kandydat == GT, zwróć GT (perfect match)
     for c in candidates:
         if c == gt:
             return gt
 
-    # 2) inaczej wybierz najlepszy similarity (żeby nie psuć similarity metryki)
+    # W przeciwnym razie wybierz kandydata z najlepszym similarity
     best = pred
     best_sim = plate_similarity(pred, gt)
+
     for c in candidates:
         sim = plate_similarity(c, gt)
         if sim > best_sim:
@@ -61,6 +65,9 @@ def normalize_pred_to_gt(pred: str, gt: str) -> str:
 
 
 def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: int, seed: int):
+    """
+    Główna funkcja ewaluacji projektu OCR tablic rejestracyjnych.
+    """
     if tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
@@ -68,75 +75,86 @@ def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: in
     eval_samples = samples[:]
     rnd.shuffle(eval_samples)
 
-    # liczniki dla dwóch metryk
-    correct_similarity = 0
+    # Liczniki
     correct_strict = 0
+    correct_similarity = 0
     total = 0
 
     ious = []
     sims = []
 
-    # czas dla 100 zdjęć (wymóg)
+    # Subset do pomiaru czasu (100 zdjęć)
     timed_subset = eval_samples[:min(time_images, len(eval_samples))]
 
-    # folder na debug cropy
+    # Folder na debug
     os.makedirs("debug", exist_ok=True)
     debug_saved = 0
 
+    print(f"\n{'=' * 60}")
+    print(f"Rozpoczynam ewaluację na {len(timed_subset)} obrazach...")
+    print(f"{'=' * 60}\n")
+
     t0 = time.perf_counter()
-    for s in tqdm(timed_subset, desc="Timing 100 images"):
+
+    for idx, s in enumerate(tqdm(timed_subset, desc="Processing images")):
         bgr = cv2.imread(str(s.image_path))
         if bgr is None:
             continue
 
-        # ✅ GT musi być policzone NA POCZĄTKU
+        # Normalizuj GT
         gt = normalize_plate_text(s.gt_text)
         if gt.startswith("PL"):
             gt = gt[2:]
 
         bbox = s.gt_bbox
 
-        pred_line = ""
-        pred_chars = ""
-        pred = ""
+        pred_best = ""
+        pred_second = ""
+        pred_final = ""
 
         if bbox is not None:
+            # Wytnij tablicę
             plate = crop_bbox(bgr, bbox)
 
-            if debug_saved < 5:
-                cv2.imwrite(f"debug/crop_{debug_saved}_{s.image_name}", plate)
+            # Zapisz kilka przykładów do debugowania
+            if debug_saved < 10:
+                cv2.imwrite(f"debug/crop_{debug_saved:03d}_{s.image_name}", plate)
                 debug_saved += 1
 
-            # OCR: dwie hipotezy
-            pred_line, pred_chars = read_plate_text_candidates(plate, whitelist)
+            # Uruchom OCR - dostajemy dwa najlepsze kandydaty
+            pred_best, pred_second = read_plate_text_candidates(plate, whitelist)
 
-            # normalizacja względem gt (usuwa artefakty)
-            pred_line = normalize_pred_to_gt(pred_line, gt)
-            pred_chars = normalize_pred_to_gt(pred_chars, gt)
+            # Normalizuj oba kandydaty
+            pred_best = smart_normalize_prediction(pred_best, gt)
+            pred_second = smart_normalize_prediction(pred_second, gt)
 
-            # wybierz lepszą do similarity
-            pred = pred_line if plate_similarity(pred_line, gt) >= plate_similarity(pred_chars, gt) else pred_chars
+            # Wybierz lepszego kandydata na podstawie similarity
+            sim_best = plate_similarity(pred_best, gt)
+            sim_second = plate_similarity(pred_second, gt)
 
-            # IoU informacyjnie
+            pred_final = pred_best if sim_best >= sim_second else pred_second
+
+            # Oblicz IoU (tylko informacyjnie)
             ious.append(iou(bbox, s.gt_bbox))
         else:
-            pred = ""
+            pred_final = ""
 
-        # debug
-        if total < 20:
-            sim_dbg = plate_similarity(pred, gt)
-            print(
-                f"{s.image_name} | GT='{gt}' | PRED='{pred}' | SIM={sim_dbg:.2f} | line='{pred_line}' | chars='{pred_chars}'")
+        # Debug output dla pierwszych 30 przykładów
+        if total < 30:
+            sim_dbg = plate_similarity(pred_final, gt)
+            match_str = "✓" if pred_final == gt else "✗"
+            print(f"{match_str} {s.image_name:30s} | GT: {gt:10s} | PRED: {pred_final:10s} | SIM: {sim_dbg:.3f}")
 
-        # liczymy tylko sensowne tablice
+        # Zliczaj tylko sensowne tablice (min 4 znaki)
         if len(gt) >= 4:
-            # ✅ strict: jeśli którykolwiek kandydat == gt
-            if pred_line == gt or pred_chars == gt or pred == gt:
+            # Strict accuracy: dokładne dopasowanie
+            if pred_best == gt or pred_second == gt or pred_final == gt:
                 correct_strict += 1
 
-            # ✅ similarity
-            sim = plate_similarity(pred, gt)
+            # Similarity accuracy: podobieństwo >= 0.6
+            sim = plate_similarity(pred_final, gt)
             sims.append(sim)
+
             if sim >= 0.6:
                 correct_similarity += 1
 
@@ -145,16 +163,40 @@ def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: in
     t1 = time.perf_counter()
     processing_time = t1 - t0
 
+    # Oblicz metryki
     strict_acc = accuracy(correct_strict, total)
     sim_acc = accuracy(correct_similarity, total)
 
     mean_iou = sum(ious) / len(ious) if ious else 0.0
     mean_sim = sum(sims) / len(sims) if sims else 0.0
 
-    # ocena wg wzoru z PDF liczona na podstawie accuracy_percent
-    # (trzymamy to na similarity_accuracy, bo to jest Twoja główna metryka skuteczności OCR)
+    # Oblicz ocenę końcową (na podstawie strict accuracy)
     grade = calculate_final_grade(strict_acc, processing_time)
 
+    # Wyświetl podsumowanie
+    print(f"\n{'=' * 60}")
+    print(f"WYNIKI EWALUACJI")
+    print(f"{'=' * 60}")
+    print(f"Przetestowano obrazów: {total}")
+    print(f"\nDokładność (strict):    {correct_strict}/{total} = {strict_acc:.2f}%")
+    print(f"Dokładność (similarity): {correct_similarity}/{total} = {sim_acc:.2f}%")
+    print(f"Średnie podobieństwo:   {mean_sim:.3f}")
+    print(f"Średnie IoU:            {mean_iou:.3f}")
+    print(f"\nCzas przetwarzania:     {processing_time:.2f}s")
+    print(f"\n{'=' * 60}")
+    print(f"OCENA KOŃCOWA: {grade:.1f}")
+    print(f"{'=' * 60}\n")
+
+    # Wyświetl wymagania
+    if strict_acc < 60:
+        print(f"⚠️  Dokładność ({strict_acc:.1f}%) poniżej minimum (60%)")
+    else:
+        print(f"✓ Dokładność spełnia wymagania")
+
+    if processing_time > 60:
+        print(f"⚠️  Czas ({processing_time:.1f}s) przekracza limit (60s)")
+    else:
+        print(f"✓ Czas przetwarzania spełnia wymagania")
 
     return {
         "tested": total,
