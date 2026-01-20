@@ -10,11 +10,9 @@ def normalize_plate_text(s: str) -> str:
     return s
 
 
-def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
+def preprocess_for_ocr(plate_bgr: np.ndarray, variant: str = "main") -> np.ndarray:
     gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-
-    # zwiększ kontrast
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
     th = cv2.adaptiveThreshold(
@@ -22,16 +20,22 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
         cv2.THRESH_BINARY, 31, 7
     )
 
-    # jeśli obraz jest "za biały" (znaki znikają), spróbuj odwrócić
-    white_ratio = (th > 0).mean()
-    if white_ratio > 0.85:
+    # warianty pomagają przy różnych warunkach
+    if variant == "invert":
         th = cv2.bitwise_not(th)
 
-    # delikatne czyszczenie
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    # auto-invert jeśli "za biało"
+    white_ratio = (th > 0).mean()
+    if white_ratio > 0.88:
+        th = cv2.bitwise_not(th)
+
+    # delikatne czyszczenie tylko w głównym wariancie
+    if variant == "main":
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
 
     return th
+
 
 def read_plate_by_chars(plate_bgr: np.ndarray, whitelist: str) -> str:
     img = preprocess_for_ocr(plate_bgr)  # binarka 0/255
@@ -93,31 +97,33 @@ def fix_common_ocr_confusions(s: str) -> str:
     })
     return s.translate(repl)
 
+def ocr_on_image(img: np.ndarray, whitelist: str, psm: int) -> str:
+    cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}"
+    raw = pytesseract.image_to_string(img, config=cfg)
+    return fix_common_ocr_confusions(normalize_plate_text(raw))
+
+
+def read_plate_text_candidates(plate_bgr: np.ndarray, whitelist: str) -> tuple[str, str]:
+    img_main = preprocess_for_ocr(plate_bgr, variant="main")
+    img_inv = preprocess_for_ocr(plate_bgr, variant="invert")
+
+    line_main = ocr_on_image(img_main, whitelist, psm=7)
+    line_inv  = ocr_on_image(img_inv,  whitelist, psm=8)
+
+    # fallback jeśli któryś pusty
+    if not line_inv:
+        line_inv = line_main
+    if not line_main:
+        line_main = line_inv
+
+    return line_main, line_inv
+
+
+
 def read_plate_text(plate_bgr: np.ndarray, whitelist: str) -> str:
-    img = preprocess_for_ocr(plate_bgr)
-
-    # OCR całej tablicy (2 ustawienia)
-    configs = [
-        f"--oem 3 --psm 7 -c tessedit_char_whitelist={whitelist}",
-        f"--oem 3 --psm 8 -c tessedit_char_whitelist={whitelist}",
-    ]
-
-    best_line = ""
-    for cfg in configs:
-        raw = pytesseract.image_to_string(img, config=cfg)
-        text = normalize_plate_text(raw)
-        if len(text) > len(best_line):
-            best_line = text
-
-    # OCR znak po znaku
-    by_chars = read_plate_by_chars(plate_bgr, whitelist)
-
-    # postprocess pomyłek (łagodnie)
-    best_line = fix_common_ocr_confusions(best_line)
-    by_chars = fix_common_ocr_confusions(by_chars)
-
-    # wybierz to, co ma sensowną długość (PL zwykle 6–8)
+    best_line, by_chars = read_plate_text_candidates(plate_bgr, whitelist)
+    # nadal zwracaj “najbardziej sensowne” do similarity
     candidates = [best_line, by_chars]
     candidates.sort(key=lambda s: (abs(len(s) - 7), -len(s)))
-
     return candidates[0]
+

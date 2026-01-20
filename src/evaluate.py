@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from .detect import crop_bbox
 from .ocr import read_plate_text, normalize_plate_text
+from .ocr import read_plate_text, read_plate_text_candidates
 from .metrics import accuracy, iou, calculate_final_grade
 
 
@@ -88,41 +89,52 @@ def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: in
         if bgr is None:
             continue
 
-        # "oracle detector" – używamy bbox z adnotacji
-        bbox = s.gt_bbox
-
-        if bbox is None:
-            pred = ""
-        else:
-            plate = crop_bbox(bgr, bbox)
-
-            # zapis 5 pierwszych cropów do podglądu
-            if debug_saved < 5:
-                cv2.imwrite(f"debug/crop_{debug_saved}_{s.image_name}", plate)
-                debug_saved += 1
-
-            pred = read_plate_text(plate, whitelist)
-
-            # IoU informacyjnie (tu wyjdzie 1.0)
-            ious.append(iou(bbox, s.gt_bbox))
-
+        # ✅ GT musi być policzone NA POCZĄTKU
         gt = normalize_plate_text(s.gt_text)
         if gt.startswith("PL"):
             gt = gt[2:]
 
-        pred = normalize_pred_to_gt(pred, gt)
+        bbox = s.gt_bbox
 
+        pred_line = ""
+        pred_chars = ""
+        pred = ""
+
+        if bbox is not None:
+            plate = crop_bbox(bgr, bbox)
+
+            if debug_saved < 5:
+                cv2.imwrite(f"debug/crop_{debug_saved}_{s.image_name}", plate)
+                debug_saved += 1
+
+            # OCR: dwie hipotezy
+            pred_line, pred_chars = read_plate_text_candidates(plate, whitelist)
+
+            # normalizacja względem gt (usuwa artefakty)
+            pred_line = normalize_pred_to_gt(pred_line, gt)
+            pred_chars = normalize_pred_to_gt(pred_chars, gt)
+
+            # wybierz lepszą do similarity
+            pred = pred_line if plate_similarity(pred_line, gt) >= plate_similarity(pred_chars, gt) else pred_chars
+
+            # IoU informacyjnie
+            ious.append(iou(bbox, s.gt_bbox))
+        else:
+            pred = ""
+
+        # debug
         if total < 20:
-            sim = plate_similarity(pred, gt)
-            print(f"{s.image_name} | GT='{gt}' | PRED='{pred}' | SIM={sim:.2f}")
+            sim_dbg = plate_similarity(pred, gt)
+            print(
+                f"{s.image_name} | GT='{gt}' | PRED='{pred}' | SIM={sim_dbg:.2f} | line='{pred_line}' | chars='{pred_chars}'")
 
         # liczymy tylko sensowne tablice
         if len(gt) >= 4:
-            # 1) strict
-            if pred == gt:
+            # ✅ strict: jeśli którykolwiek kandydat == gt
+            if pred_line == gt or pred_chars == gt or pred == gt:
                 correct_strict += 1
 
-            # 2) similarity-threshold
+            # ✅ similarity
             sim = plate_similarity(pred, gt)
             sims.append(sim)
             if sim >= 0.6:
