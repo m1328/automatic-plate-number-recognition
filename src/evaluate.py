@@ -117,7 +117,7 @@ def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: in
             plate = crop_bbox(bgr, bbox)
 
             # Zapisz kilka przykładów do debugowania
-            if debug_saved < 10:
+            if debug_saved < 3:
                 cv2.imwrite(f"debug/crop_{debug_saved:03d}_{s.image_name}", plate)
                 debug_saved += 1
 
@@ -140,7 +140,7 @@ def evaluate(samples, whitelist: str, tesseract_cmd: str | None, time_images: in
             pred_final = ""
 
         # Debug output dla pierwszych 30 przykładów
-        if total < 30:
+        if total < 10:
             sim_dbg = plate_similarity(pred_final, gt)
             match_str = "✓" if pred_final == gt else "✗"
             print(f"{match_str} {s.image_name:30s} | GT: {gt:10s} | PRED: {pred_final:10s} | SIM: {sim_dbg:.3f}")

@@ -59,57 +59,51 @@ def fix_common_ocr_errors(text: str) -> str:
 
 def preprocess_plate_v2(plate_bgr: np.ndarray) -> List[np.ndarray]:
     """
-    Zwraca wiele wariantów preprocessingu - zwiększa szansę na sukces.
+    Szybszy preprocessing: mniej wariantów + lżejsze operacje.
+    Cel: zejść z czasem, a accuracy podnieść/utrzymać ostrożnie.
     """
     results = []
 
-    # Powiększ obraz (ważne dla OCR)
-    scale = 3.0
+    # Powiększ obraz (ważne dla OCR) - ale trochę mniej niż 3.0 (szybciej)
+    scale = 2.5
     h, w = plate_bgr.shape[:2]
-    plate_large = cv2.resize(plate_bgr, (int(w * scale), int(h * scale)),
-                             interpolation=cv2.INTER_CUBIC)
+    plate_large = cv2.resize(
+        plate_bgr, (int(w * scale), int(h * scale)),
+        interpolation=cv2.INTER_CUBIC
+    )
 
     gray = cv2.cvtColor(plate_large, cv2.COLOR_BGR2GRAY)
 
-    # Wariant 1: Bilateral filter + adaptive threshold
-    blurred = cv2.bilateralFilter(gray, 11, 17, 17)
-    thresh1 = cv2.adaptiveThreshold(blurred, 255,
-                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 11, 2)
+    # Wariant 1: Bilateral + adaptive threshold (zwykle najlepszy "bang for buck")
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
+    thresh1 = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 15
+    )
     results.append(thresh1)
 
-    # Wariant 2: Otsu thresholding
-    blurred2 = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh2 = cv2.threshold(blurred2, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Wariant 2: Otsu (szybki i często działa)
+    _, thresh2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     results.append(thresh2)
 
-    # Wariant 3: Inverted Otsu
-    results.append(cv2.bitwise_not(thresh2))
-
-    # Wariant 4: Morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    morph = cv2.morphologyEx(thresh1, cv2.MORPH_CLOSE, kernel)
-    results.append(morph)
-
-    # Wariant 5: CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    _, thresh5 = cv2.threshold(enhanced, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    results.append(thresh5)
+    # Wariant 3: Otsu inverted (czasem tablica ma odwrotne kolory)
+    _, thresh3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    results.append(thresh3)
 
     return results
 
 
 def run_tesseract_configs(img: np.ndarray, whitelist: str) -> List[str]:
     """
-    Próbuje różnych konfiguracji Tesseract.
+    Szybsze konfiguracje Tesseract:
+    - mniej PSM (najczęściej wystarczają 7 i 8)
     """
     results = []
 
-    # Różne Page Segmentation Modes
-    psm_modes = [7, 8, 6, 13]  # 7=single line, 8=single word, 6=block, 13=raw line
+    # mniej trybów = dużo mniej czasu
+    psm_modes = [7, 8]  # 7=single line, 8=single word
 
     for psm in psm_modes:
         config = f'--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}'
@@ -193,35 +187,48 @@ def read_plate_text_improved(plate_bgr: np.ndarray, whitelist: str) -> str:
 
 def read_plate_text_candidates(plate_bgr: np.ndarray, whitelist: str) -> Tuple[str, str]:
     """
-    Zwraca dwa najlepsze kandydaty (dla kompatybilności z evaluate.py).
+    Zwraca dwa najlepsze kandydaty (dla kompatybilności z evaluate.py),
+    ale z early-exit (duże przyspieszenie).
     """
     if plate_bgr is None or plate_bgr.size == 0:
         return "", ""
 
     preprocessed_images = preprocess_plate_v2(plate_bgr)
 
-    all_candidates = []
+    best = ""
+    second = ""
+    best_score = 0.0
+    second_score = 0.0
 
-    for img in preprocessed_images[:3]:  # Pierwsze 3 warianty dla szybkości
+    # tylko 3 warianty (i tak preprocess zwraca 3 po zmianie)
+    for img in preprocessed_images[:3]:
         texts = run_tesseract_configs(img, whitelist)
-        all_candidates.extend(texts)
 
-    if not all_candidates:
+        for t in texts:
+            if not t:
+                continue
+
+            t = fix_common_ocr_errors(t)
+            sc = score_plate_candidate(t)
+
+            if sc > best_score:
+                second_score = best_score
+                second = best
+                best_score = sc
+                best = t
+            elif sc > second_score and t != best:
+                second_score = sc
+                second = t
+
+            # EARLY EXIT: jeśli mamy już bardzo dobry wynik, kończymy
+            # (to najczęściej zbija czas poniżej 60s/100)
+            if best_score >= 0.95 and second_score >= 0.80:
+                return best, (second or best)
+
+    if not best:
         return "", ""
 
-    # Usuń duplikaty i popraw błędy
-    candidates = list(set(all_candidates))
-    candidates = [fix_common_ocr_errors(c) for c in candidates]
-
-    # Oceń
-    scored = [(c, score_plate_candidate(c)) for c in candidates]
-    scored.sort(key=lambda x: x[1], reverse=True)
-
-    # Zwróć top 2
-    best = scored[0][0] if len(scored) > 0 else ""
-    second = scored[1][0] if len(scored) > 1 else best
-
-    return best, second
+    return best, (second or best)
 
 
 # Zachowaj starą funkcję dla kompatybilności
