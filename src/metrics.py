@@ -1,6 +1,7 @@
 def accuracy(correct: int, total: int) -> float:
     return 0.0 if total == 0 else (correct / total) * 100.0
 
+
 def iou(b1: tuple[int,int,int,int], b2: tuple[int,int,int,int]) -> float:
     x1 = max(b1[0], b2[0])
     y1 = max(b1[1], b2[1])
@@ -13,8 +14,8 @@ def iou(b1: tuple[int,int,int,int], b2: tuple[int,int,int,int]) -> float:
     union = a1 + a2 - inter
     return 0.0 if union == 0 else inter / union
 
+
 def calculate_final_grade(accuracy_percent: float, processing_time_sec: float) -> float:
-    # Wg polecenia z PDF :contentReference[oaicite:2]{index=2}
     if accuracy_percent < 60 or processing_time_sec > 60:
         return 2.0
     accuracy_norm = (accuracy_percent - 60) / 40

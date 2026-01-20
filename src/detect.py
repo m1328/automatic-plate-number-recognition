@@ -12,7 +12,6 @@ def _refine_plate_in_roi(roi_bgr: np.ndarray) -> tuple[int, int, int, int] | Non
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # binarka + krawędzie
     th = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 31, 5
@@ -38,7 +37,6 @@ def _refine_plate_in_roi(roi_bgr: np.ndarray) -> tuple[int, int, int, int] | Non
         if not (2.0 <= aspect <= 8.0):
             continue
 
-        # tablica raczej nie zajmuje całego ROI
         if ww > 0.95 * w or hh > 0.95 * h:
             continue
 
@@ -53,7 +51,6 @@ def _refine_plate_in_roi(roi_bgr: np.ndarray) -> tuple[int, int, int, int] | Non
 def detect_plate_bbox(bgr: np.ndarray) -> tuple[int, int, int, int] | None:
     h, w = bgr.shape[:2]
 
-    # resize dla szybkości
     target_w = 1280
     scale = 1.0
     if w > target_w:
@@ -89,7 +86,6 @@ def detect_plate_bbox(bgr: np.ndarray) -> tuple[int, int, int, int] | None:
             best_score = score
             best = (x, y, x + ww, y + hh)
 
-    # fallback: środkowo-dolna część (jak miałaś)
     if best is None:
         hs, ws = bgr_small.shape[:2]
         x1 = int(ws * 0.2)
@@ -98,7 +94,6 @@ def detect_plate_bbox(bgr: np.ndarray) -> tuple[int, int, int, int] | None:
         y2 = int(hs * 0.90)
         best = (x1, y1, x2, y2)
 
-    # refine: szukamy tablicy w ROI
     x1, y1, x2, y2 = best
     roi = bgr_small[y1:y2, x1:x2]
     refined = _refine_plate_in_roi(roi)
@@ -107,7 +102,6 @@ def detect_plate_bbox(bgr: np.ndarray) -> tuple[int, int, int, int] | None:
         rx1, ry1, rx2, ry2 = refined
         best = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
 
-    # przeskaluj do oryginału
     if scale != 1.0:
         x1, y1, x2, y2 = best
         x1 = int(x1 / scale); y1 = int(y1 / scale)

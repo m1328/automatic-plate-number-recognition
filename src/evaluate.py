@@ -29,14 +29,13 @@ def smart_normalize_prediction(pred: str, gt: str) -> str:
 
     candidates = [pred]
 
-    # Usuń 1-2 znaki z początku/końca (częste artefakty)
-    for start_cut in range(3):  # 0, 1, 2
+    for start_cut in range(3):
         for end_cut in range(3):
             if start_cut + end_cut >= len(pred):
                 continue
 
             if start_cut == 0 and end_cut == 0:
-                continue  # już mamy oryginał
+                continue
 
             if end_cut == 0:
                 candidate = pred[start_cut:]

@@ -2,12 +2,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from lxml import etree
 
+
 @dataclass(frozen=True)
 class Sample:
     image_name: str
     image_path: Path
     gt_text: str
     gt_bbox: tuple[int, int, int, int]  # x1,y1,x2,y2
+
 
 def load_samples(annotations_path: Path, photos_dir: Path) -> list[Sample]:
     tree = etree.parse(str(annotations_path))
